@@ -9,3 +9,6 @@ torch
 sentencepiece
 python-multipart
 pydantic
+PyPDF2
+paddlepaddle
+pillow
