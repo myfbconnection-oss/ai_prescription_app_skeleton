@@ -1,143 +1,119 @@
+# delivery.py
+from __future__ import annotations
+
+from datetime import datetime
+from math import ceil
+from typing import Optional, Dict, Any
+
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
-from typing import List, Optional
-from itertools import combinations
-import math
-import random
+from pydantic import BaseModel, Field, conint, confloat
 
-router = APIRouter()
+router = APIRouter(prefix="/delivery", tags=["Delivery"])
 
-# -----------------------------
-# Pydantic Models
-# -----------------------------
-class UserLocation(BaseModel):
-    latitude: float
-    longitude: float
+# ---------- Configuration (tune as needed) ----------
+SMALL_ORDER_THRESHOLD: float = 10.0         # surcharge if cart_value < 10
+BASE_DISTANCE_METERS: int = 1000            # first 1000 m
+BASE_FEE: float = 2.0                        # base fee for first 1 km
+ADDITIONAL_BLOCK_METERS: int = 500           # step for extra distance
+ADDITIONAL_BLOCK_FEE: float = 1.0            # fee per 500 m block beyond 1 km
+ITEM_SURCHARGE_START_AT: int = 5             # surcharge applies from the 5th item (inclusive)
+ITEM_SURCHARGE_PER_ITEM: float = 0.50        # surcharge amount per item from 5th onward
+FREE_DELIVERY_CART_VALUE: float = 100.0      # free delivery if cart >= 100
+MAX_DELIVERY_FEE: float = 15.0               # cap the delivery fee
+
+def money(value: float) -> float:
+    """Round monetary values to two decimals (half-even)."""
+    # Slight epsilon to avoid floating rounding artifacts
+    return round(value + 1e-12, 2)
+
+# ---------- Models ----------
 class DeliveryRequest(BaseModel):
-    prescription_salts: List[str]
-    user_location: UserLocation
-    demand_factor: Optional[float] = 0.0
-    convenience_factor: Optional[bool] = True
+    cart_value: confloat(ge=0) = Field(..., description="Total cart value in currency units (e.g., 12.35)")
+    delivery_distance: conint(ge=0) = Field(..., description="Delivery distance in meters (e.g., 1499)")
+    item_count: conint(ge=0) = Field(..., description="Total number of items in the cart")
+    time: Optional[datetime] = Field(
+        None,
+        description="ISO8601 datetime (optional, for future rules like rush-hour)"
+    )
 
-# -----------------------------
-# Generate Mock Data
-# -----------------------------
-def generate_mock_shops():
-    base_lat = 28.5355
-    base_lon = 77.3910
-    salts = [f"Medicine {i}mg" for i in range(1, 51)]
-    shops = []
+class DeliveryBreakdown(BaseModel):
+    small_order_surcharge: float
+    distance_fee: float
+    item_surcharge: float
+    capped: bool
+    free_delivery_applied: bool
 
-    for i in range(1, 51):
-        shop_inventory = {}
-        # Inventory variation
-        if i % 5 == 0:
-            available_salts = salts  # full inventory
-        elif i % 3 == 0:
-            available_salts = random.sample(salts, 35)  # partial inventory
-        else:
-            available_salts = random.sample(salts, 20)  # limited inventory
+class DeliveryResponse(BaseModel):
+    total_fee: float = Field(..., description="Final delivery fee after rules, cap, and free delivery check")
+    currency: str = Field("EUR", description="Currency code for the amounts returned")
+    breakdown: DeliveryBreakdown
 
-        for salt in available_salts:
-            shop_inventory[salt] = {
-                "brand": f"Brand_{salt.replace(' ', '')}_{i}",
-                "price": round(random.uniform(5.0, 20.0), 2)
-            }
+# ---------- Core calculation ----------
+def calculate_fee(payload: DeliveryRequest) -> DeliveryResponse:
+    # Free delivery if cart value hits threshold
+    if payload.cart_value >= FREE_DELIVERY_CART_VALUE:
+        breakdown = DeliveryBreakdown(
+            small_order_surcharge=0.0,
+            distance_fee=0.0,
+            item_surcharge=0.0,
+            capped=False,
+            free_delivery_applied=True,
+        )
+        return DeliveryResponse(total_fee=0.0, currency="EUR", breakdown=breakdown)
 
-        shop = {
-            "shop_id": f"S{i:03}",
-            "shop_name": f"Vendor_{i}",
-            "base_cost": round(random.uniform(0.0, 25.0), 2),
-            "location": {
-                "latitude": base_lat + random.uniform(-0.01, 0.01),
-                "longitude": base_lon + random.uniform(-0.01, 0.01)
-            },
-            "inventory": shop_inventory
-        }
-        shops.append(shop)
-    return shops, salts
+    # Small-order surcharge
+    small_order_surcharge = 0.0
+    if payload.cart_value < SMALL_ORDER_THRESHOLD:
+        small_order_surcharge = SMALL_ORDER_THRESHOLD - payload.cart_value
 
-shops, all_salts = generate_mock_shops()
+    # Distance fee
+    distance_fee = BASE_FEE
+    if payload.delivery_distance > BASE_DISTANCE_METERS:
+        extra_meters = payload.delivery_distance - BASE_DISTANCE_METERS
+        extra_blocks = ceil(extra_meters / ADDITIONAL_BLOCK_METERS)
+        distance_fee += extra_blocks * ADDITIONAL_BLOCK_FEE
 
-# -----------------------------
-# Helper Functions
-# -----------------------------
-def calculate_distance_km(loc1, loc2):
-    return math.sqrt((loc1["latitude"] - loc2["latitude"])**2 + (loc1["longitude"] - loc2["longitude"])**2) * 111
+    # Item surcharge (from 5th item inclusive)
+    # If item_count >= 5, surcharge applies to items: 5, 6, ..., item_count
+    item_surcharge_items = max(0, payload.item_count - (ITEM_SURCHARGE_START_AT - 1))
+    item_surcharge = item_surcharge_items * ITEM_SURCHARGE_PER_ITEM
 
-def calculate_delivery_cost(base_cost, distance_km, demand_factor):
-    return base_cost + (distance_km * 5) + demand_factor
-def get_fulfillment_combinations(prescription_salts):
-    valid_combinations = []
-    for r in range(1, len(shops)+1):
-        for combo in combinations(shops, r):
-            covered_salts = set()
-            for shop in combo:
-                covered_salts.update(shop["inventory"].keys())
-            if all(salt in covered_salts for salt in prescription_salts):
-                valid_combinations.append(combo)
-    return valid_combinations
+    # Sum & cap
+    raw_total = small_order_surcharge + distance_fee + item_surcharge
+    free_delivery_applied = False
+    capped = False
 
-# -----------------------------
-# Endpoint
-# -----------------------------
-@router.post("/delivery/calculate")
-def calculate_delivery(request: DeliveryRequest):
-    prescription_salts = request.prescription_salts
-    user_location = request.user_location
-    demand_factor = request.demand_factor
-    convenience_factor = request.convenience_factor
+    total_fee = raw_total
+    if total_fee > MAX_DELIVERY_FEE:
+        total_fee = MAX_DELIVERY_FEE
+        capped = True
 
-    combinations_list = get_fulfillment_combinations(prescription_salts)
-    if not combinations_list:
-        raise HTTPException(status_code=404, detail="No shop combinations found to fulfill prescription.")
+    # Round all monetary values
+    breakdown = DeliveryBreakdown(
+        small_order_surcharge=money(small_order_surcharge),
+        distance_fee=money(distance_fee),
+        item_surcharge=money(item_surcharge),
+        capped=capped,
+        free_delivery_applied=free_delivery_applied,
+    )
+    return DeliveryResponse(total_fee=money(total_fee), currency="EUR", breakdown=breakdown)
 
-    ranked_options = []
+# ---------- Route ----------
+@router.post("/calculate", response_model=DeliveryResponse, summary="Calculate delivery fee")
+def calculate_delivery(payload: DeliveryRequest) -> DeliveryResponse:
+    """
+    Calculate the delivery fee based on:
+      - Small-order surcharge if `cart_value < 10`.
+      - Base distance fee for first `1000 m` (2.0).
+      - +1.0 for each additional `500 m` block beyond the first 1 km (ceil).
+      - +0.50 per item from the 5th item inclusive.
+      - Free delivery if `cart_value >= 100`.
+      - Fee cap at `15.0`.
 
-    for combo in combinations_list:
-        fulfillment_details = []
-        total_medicine_cost = 0.0
-        total_delivery_cost = 0.0
-
-        for shop in combo:
-            items = []
-            for salt in prescription_salts:
-                if salt in shop["inventory"]:
-                    item = shop["inventory"][salt]
-                    items.append({
-                        "salt": salt,
-                        "brand": item["brand"],
-                        "price": item["price"]
-                    })
-                    total_medicine_cost += item["price"]
-
-            distance_km = calculate_distance_km(shop["location"], user_location.dict())
-            delivery_cost = calculate_delivery_cost(shop["base_cost"], distance_km, demand_factor)
-            total_delivery_cost += delivery_cost
-
-            fulfillment_details.append({
-                "shop_id": shop["shop_id"],
-                "shop_name": shop["shop_name"],
-                "delivery_cost": round(delivery_cost, 2),
-                "items": items
-            })
-
-        grand_total = round(total_medicine_cost + total_delivery_cost, 2)
-        ranked_options.append({
-            "num_shops": len(combo),
-            "total_medicine_cost": round(total_medicine_cost, 2),
-            "total_delivery_cost": round(total_delivery_cost, 2),
-            "grand_total": grand_total,
-            "fulfillment_details": fulfillment_details
-        })
-
-    ranked_options.sort(key=lambda x: (x["num_shops"], x["grand_total"]))
-    for i, option in enumerate(ranked_options):
-        option["rank"] = i + 1
-        option["priority_reason"] = "Fewest shops + reasonable cost" if convenience_factor else "Lowest cost"
-
-    return {
-        "msg": "✅ Optimal fulfillment scenarios calculated and ranked.",
-        "prescription_salts": prescription_salts,
-        "optimal_options_ranked": ranked_options
-    }
+    Returns a detailed breakdown and the final total fee.
+    """
+    try:
+        return calculate_fee(payload)
+    except Exception as exc:
+        # In case of an unexpected internal error; helps Swagger show a clear message.
+        raise HTTPException(status_code=500, detail=f"Delivery fee calculation failed: {exc}")
