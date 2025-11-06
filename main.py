@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from routers import auth, upload, ocr, nlp, rag, optimizer, delivery, payment, admin
+from routers import auth, upload, ocr, nlp, rag, optimizer, delivery, payment, admin  # ✅ Added test_ocr
 
 app = FastAPI(title="AI Prescription App MVP - Modular Skeleton")
 
